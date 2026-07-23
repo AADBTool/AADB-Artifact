@@ -1,0 +1,14 @@
+benchmark,variant,total_execution_time_seconds
+Deepsjeng_s,1.36
+Gcc_s,1.31
+Imagick_s,2.99
+Lbm_s,4.90
+Leela_s,1.36
+Mcf_s,1.46
+Omnetpp_s,1.40
+Perlbench_s,3.57
+X264_s,2.33
+Xalancbmk_s,1.59
+Xz_s,1.44
+Nab_s,1.73
+geomean,1.91
