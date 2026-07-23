@@ -1,0 +1,1366 @@
+//===-- Reorder.cpp - Example Transformation --------------------------===//
+//
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
+
+#include "llvm/Transforms/Utils/Reorder_Spec.h"
+#include "llvm/IR/InstIterator.h"
+#include "llvm/IR/Instructions.h"
+#include "llvm/Analysis/AliasAnalysis.h"
+#include "llvm/Analysis/AliasAnalysisEvaluator.h"
+#include "llvm/Analysis/ScalarEvolution.h"
+#include "llvm/Analysis/DependenceAnalysis.h"
+#include "llvm/Analysis/ScalarEvolutionExpressions.h"
+#include "llvm/Analysis/AliasGraph.h"
+#include "llvm/Analysis/BasicAliasAnalysis.h"
+#include "llvm/Analysis/GlobalsModRef.h"
+#include "llvm/Analysis/MemoryLocation.h"
+#include "llvm/Analysis/TargetLibraryInfo.h"
+#include "llvm/ADT/SetVector.h"
+#include "llvm/IR/DataLayout.h"
+#include "llvm/IR/Function.h"
+#include "llvm/IR/Module.h"
+#include "llvm/InitializePasses.h"
+#include "llvm/Pass.h"
+#include "llvm/Support/CommandLine.h"
+#include "llvm/Support/raw_ostream.h"
+#include "llvm/Support/SourceMgr.h"
+#include "llvm/Analysis/BasicAliasAnalysis.h"
+#include "llvm/Analysis/MemoryLocation.h"
+#include "llvm/IR/PassManager.h"
+#include "llvm/IR/CFG.h"
+#include <queue>
+#include <fstream>
+#include <regex>
+#include <string>
+#include <iostream>
+#include <mysql/mysql.h>
+#include <omp.h>
+ using namespace llvm;
+#define DEBUG_PRINT;
+// #define DEBUG_DISTANCE;
+// #define DEBUG_PRINT_INTERPROCEDURAL;
+   //create global variables for wasted and reorder counts
+ int globalWasted_Spec = 0;
+ int globalReorder_Spec = 0;
+ int globaldiffchainedgraphaa_Spec = 0;
+ int run_globaldiffcahinedgraphaa_call_Spec = 0;
+ int globalAcrossCallReorder_Spec = 0;
+ int globalAcrossCallWasted_Spec = 0;
+ int globaldiffchainedsvfgraphaa_Spec = 0;
+ int globaldiffchainedsvfgraphaa_call_Spec = 0;
+ int globaldiffchainedsvf_Spec = 0;
+ static cl::opt<bool> EnableSpeculativeReordering_Spec(
+  "enable-spec-reordering-spec", cl::init(false), cl::Hidden,
+  cl::desc("Enable Speculative Reordering."));
+
+  static cl::opt<bool> EnableAACallReordering_Spec(
+    "enable-aa-call-reordering-spec", cl::init(false), cl::Hidden,
+    cl::desc("Enable AA Call Reordering."));
+
+  static cl::opt<bool> EnableAcrossCallReordering_Spec(
+    "enable-across-call-reordering-spec", cl::init(false), cl::Hidden,
+    cl::desc("Enable Reordering across calls."));
+
+  static cl::opt<int> ReorderDistance_Spec(
+    "reorder-distance-spec", cl::init(10000000000), cl::Hidden,
+    cl::desc("Reorder distance."));
+ 
+static cl::opt<bool> EnableQueryMode(
+    "enable-query-mode-spec", cl::init(false), cl::Hidden,
+    cl::desc("Enable query mode for specific pointer pairs"));
+
+static cl::opt<bool> EnablePrecomputedAliasResults(
+    "enable-precomputed-alias-results-spec", cl::init(false), cl::Hidden,
+    cl::desc("Enable use of precomputed alias results from file"));
+
+static cl::opt<bool> EnablePrecomputedAliasResults_interprocedural(
+    "enable-precomputed-alias-results-spec-interprocedural", cl::init(false), cl::Hidden,
+    cl::desc("Enable use of precomputed interprocedural results from file")
+); 
+
+static cl::opt<bool> ChainGraphaawithSVF(
+    "chain-graphaawith-svf-spec", cl::init(false), cl::Hidden,
+    cl::desc("Chain Graph AA with SVF Graph AA"));
+
+static cl::opt<bool> EnableGraphAA(
+    "enable-graph-aa-spec", cl::init(false), cl::Hidden,
+    cl::desc("Enable Graph AA for alias analysis"));
+
+// std::string fetchAAByPrimaryKey_Spec(const std::string &ptr1, const std::string &ptr2, const std::string &moduleName = "", const std::string &functionName = "") {
+//   std::string key; // Assuming this is the primary key column name
+//   if(moduleName == "" || functionName == "" || ptr1 == "" || ptr2 == "") {
+//     return "MayAlias"; // Default to MayAlias if module or function name is empty
+//   }  
+//   MYSQL* conn = mysql_init(nullptr);
+//    key = "&" + ptr1 + "@" + "Load" + "&" + ptr2 + "@" + "Store"; // Construct key from inputs
+// #ifdef DEBUG_PRINT
+//    errs() << "Querying alias for: " << key << "\n";
+// #endif
+//     if (conn == nullptr) {
+//         std::cerr << "mysql_init() failed\n";
+//         return "MayAlias"; // Default to MayAlias if connection fails
+//     }
+
+//     if (!mysql_real_connect(conn, "localhost", "root", "password", "Test", 0, nullptr, 0)) {
+//         std::cerr << "mysql_real_connect() failed: " << mysql_error(conn) << "\n";
+//         mysql_close(conn);
+//         return "MayAlias"; // Default to MayAlias if connection fails
+//     }
+//         // Remove file extension (.ll, .bc, etc.)
+//     size_t lastDot = moduleName.find_last_of(".");
+//     std::string baseName = moduleName;
+//     if (lastDot != std::string::npos) {
+//         baseName = moduleName.substr(0, lastDot);
+//     }
+//     std::string innermost_name = baseName.substr(baseName.find_last_of("/\\") + 1);
+//     baseName = innermost_name;
+//     // std::string suffix = "_reorderedloads";
+//     std::regex suffix("_annotated$");
+//     std::regex ihen("-");
+//     baseName = std::regex_replace(baseName, suffix, "");
+//     baseName = std::regex_replace(baseName, ihen, "__");
+//     baseName += "_annotated";
+//     std::string query = "SELECT aa FROM " + baseName + " WHERE ptr_ptr_func = '" + key + "'";
+//     #ifdef DEBUG_PRINT
+//     errs() << "Executing query: " << query << "\n";
+//     #endif
+
+//     if (mysql_query(conn, query.c_str())) {
+//         std::cerr << "SELECT query failed: " << mysql_error(conn) << "\n";
+//         mysql_close(conn);
+//         return "MayAlias"; // Default to MayAlias if query fails
+//     }
+
+//     MYSQL_RES* res = mysql_store_result(conn);
+//     if (res == nullptr) {
+//         std::cerr << "mysql_store_result() failed: " << mysql_error(conn) << "\n";
+//         mysql_close(conn);
+//         return "MayAlias"; // Default to MayAlias if store result fails
+//     }
+
+//     MYSQL_ROW row = mysql_fetch_row(res);
+//     std::string aaValue;
+//     if (row != nullptr && row[0] != nullptr) {
+//         aaValue = row[0];
+//         #ifdef DEBUG_PRINT
+//         errs() << "Found sql entry: " << aaValue << "\n";
+//         #endif
+//     } else {
+//         std::cerr << "No matching record found.\n";
+//     }
+
+//     mysql_free_result(res);
+//     mysql_close(conn);
+
+//     return aaValue;
+// }
+
+std::string parallel_query_tables(MYSQL* base_conn, const std::string& baseName, const std::string& key, MYSQL_ROW row) {
+    int nTables = atoi(row[0]);
+    std::string aaValue;
+    bool found = false;
+
+    omp_set_num_threads(8);
+
+    #pragma omp parallel for shared(found)
+    for (int i = 0; i < nTables; i++) {
+        if (found) continue;  // Early skip if already found
+
+        // Each thread needs its own connection
+        MYSQL* conn = mysql_init(NULL);
+        if (!mysql_real_connect(conn, "localhost", "root", "password", "Test", 0, NULL, 0)) {
+            std::cerr << "Thread " << omp_get_thread_num()
+                      << " failed to connect: " << mysql_error(conn) << "\n";
+            mysql_close(conn);
+            continue;
+        }
+
+        std::string tableName = baseName;
+        tableName += "_" + std::to_string(i+1);
+
+        std::string query = "SELECT aa FROM " + tableName +
+                            " WHERE ptr_ptr_func = '" + key + "'";
+
+        #ifdef DEBUG_PRINT
+        std::cerr << "Executing query: " << query << "\n";
+        #endif
+
+        if (mysql_query(conn, query.c_str())) {
+          #ifdef DEBUG_PRINT
+            std::cerr << "SELECT failed: " << mysql_error(conn)
+                      << " for table: " << tableName << "\n";
+          #endif
+            mysql_close(conn);
+            continue;
+        }
+
+        MYSQL_RES* res = mysql_store_result(conn);
+        if (!res) {
+            std::cerr << "mysql_store_result failed: " << mysql_error(conn)
+                      << " for table: " << tableName << "\n";
+            mysql_close(conn);
+            continue;
+        }
+
+        MYSQL_ROW row_aa = mysql_fetch_row(res);
+        if (row_aa && row_aa[0]) {
+            {
+                if (!found) {
+                    aaValue = row_aa[0];
+                    #ifdef DEBUG_PRINT
+                    errs() << "Found record in " << tableName << ": " << aaValue << "\n";
+                    #endif
+                    // std::cerr << "Found record in " << tableName << ": " << aaValue << "\n";
+                    found = true;
+                }
+            }
+        } else {
+            #ifdef DEBUG_PRINT
+            errs() << "No matching record in table: " << tableName <<  " Query: " << query << "\n";
+            #endif
+            // std::cerr << "No matching record in table: " << tableName << "\n";
+        }
+
+        mysql_free_result(res);
+        mysql_close(conn);
+    }
+
+    if (!found) {
+        errs() << "No result found in any table" << " key: " << key << ".\n";
+    } else {
+      #ifdef DEBUG_PRINT
+        errs() << "Final aaValue = " << aaValue << "\n";
+      #endif
+        // std::cerr << "Final aaValue = " << aaValue << "\n";
+    }
+    return aaValue;
+}
+
+std::string fetchAAByPrimaryKey_Spec_multiple(const std::string &ptr1, const std::string &ptr2, const std::string &moduleName = "", const std::string &functionName = "") {
+// for a single module with entries above 2M, it is broken down into multiple tables with suffix _1, _2, etc, reading to database should be parallel
+  std::string key; // Assuming this is the primary key column name
+  if(moduleName == "" || functionName == "" || ptr1 == "" || ptr2 == "") {
+    return "MayAlias"; // Default to MayAlias if module or function name is empty
+  }  
+  MYSQL* conn = mysql_init(nullptr);
+   key = "&" + ptr1 + "@" + "Load" + "&" + ptr2 + "@" + "Store"; // Construct key from inputs
+#ifdef DEBUG_PRINT
+   errs() << "Querying alias for: " << key << "\n";
+#endif
+    if (conn == nullptr) {
+        std::cerr << "mysql_init() failed\n";
+        return "MayAlias"; // Default to MayAlias if connection fails
+    }
+
+    if (!mysql_real_connect(conn, "localhost", "root", "password", "Test", 0, nullptr, 0)) {
+        std::cerr << "mysql_real_connect() failed: " << mysql_error(conn) << "\n";
+        mysql_close(conn);
+        return "MayAlias"; // Default to MayAlias if connection fails
+    }
+        // Remove file extension (.ll, .bc, etc.)
+    size_t lastDot = moduleName.find_last_of(".");
+    std::string baseName = moduleName;
+    if (lastDot != std::string::npos) {
+        baseName = moduleName.substr(0, lastDot);
+    }
+    std::string innermost_name = baseName.substr(baseName.find_last_of("/\\") + 1);
+    baseName = innermost_name;
+    // std::string suffix = "_reorderedloads";
+    std::regex suffix("_annotated$");
+    std::regex ihen("-");
+    baseName = std::regex_replace(baseName, suffix, "");
+    baseName = std::regex_replace(baseName, ihen, "__");
+    baseName += "_annotated";
+    std::string query = "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'Test'   AND table_name LIKE '" + baseName + "%'"; // Construct key from inputs
+    #ifdef DEBUG_PRINT
+    errs() << "Executing query: " << query << "\n";
+    #endif
+
+    if (mysql_query(conn, query.c_str())) {
+        std::cerr << "SELECT query failed: " << mysql_error(conn) << "\n";
+        mysql_close(conn);
+        return "MayAlias"; // Default to MayAlias if query fails
+    }
+
+    MYSQL_RES* res = mysql_store_result(conn);
+    if (res == nullptr) {
+        std::cerr << "mysql_store_result() failed: " << mysql_error(conn) << "\n";
+        mysql_close(conn);
+        return "MayAlias"; // Default to MayAlias if store result fails
+    }
+
+    MYSQL_ROW row = mysql_fetch_row(res);
+    std::string aaValue;
+    if (row) {
+      #ifdef DEBUG_PRINT
+        printf("Table count: %s\n", row[0]);
+      #endif
+    } else {
+        printf("No result.\n");
+    }
+
+    aaValue = parallel_query_tables(conn, baseName, key, row);
+    #ifdef DEBUG_PRINT
+    errs() << "Found sql entry: " << aaValue << "\n";
+    #endif
+    if(aaValue == ""){
+      errs() << "No result found in any table, defaulting to MayAlias\n";
+      aaValue = "MayAlias";
+    }
+    // if (row != nullptr && row[0] != nullptr) {
+    //     aaValue = row[0];
+    //     #ifdef DEBUG_PRINT
+    //     errs() << "Found sql entry: " << aaValue << "\n";
+    //     #endif
+    // } else {
+    //     std::cerr << "No matching record found.\n";
+    // }
+
+    // mysql_free_result(res);
+    mysql_close(conn);
+    return aaValue;
+}
+
+std::string fetchAAByPrimaryKey_Spec_interprocedural(const std::string &ptr1, const std::string &ptr2, const std::string &moduleName = "", const std::string &functionName = "") {
+  std::string key; // Assuming this is the primary key column name
+  if(moduleName == "" || functionName == "" || ptr1 == "" || ptr2 == "") {
+    return "ModRef"; // Default to MayAlias if module or function name is empty
+  }  
+  MYSQL* conn = mysql_init(nullptr);
+   key = "$" + ptr1 + "@" + "Call" + "$" + ptr2 + "@" + "Mem"; // Construct key from inputs
+#ifdef DEBUG_PRINT
+   errs() << "Querying alias for: " << key << "\n";
+#endif
+    if (conn == nullptr) {
+        std::cerr << "mysql_init() failed\n";
+        return "ModRef"; // Default to MayAlias if connection fails
+    }
+
+    if (!mysql_real_connect(conn, "localhost", "root", "password", "Test", 0, nullptr, 0)) {
+        std::cerr << "mysql_real_connect() failed: " << mysql_error(conn) << "\n";
+        mysql_close(conn);
+        return "ModRef"; // Default to MayAlias if connection fails
+    }
+        // Remove file extension (.ll, .bc, etc.)
+    size_t lastDot = moduleName.find_last_of(".");
+    std::string baseName = moduleName;
+    if (lastDot != std::string::npos) {
+        baseName = moduleName.substr(0, lastDot);
+    }
+    std::string innermost_name = baseName.substr(baseName.find_last_of("/\\") + 1);
+    baseName = innermost_name;
+    // std::string suffix = "_reorderedloads";
+    std::regex suffix("_annotated$");
+    std::regex ihen("-");
+    baseName = std::regex_replace(baseName, suffix, "");
+    baseName = std::regex_replace(baseName, ihen, "__");
+    baseName += "_annotated_interprocedural";
+    std::string query = "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'Test'   AND table_name LIKE '" + baseName + "%'";
+    #ifdef DEBUG_PRINT_INTERPROCEDURAL
+    errs() << "Executing query: " << query << "\n";
+    #endif
+
+    if (mysql_query(conn, query.c_str())) {
+        std::cerr << "SELECT query failed: " << mysql_error(conn) << "\n";
+        mysql_close(conn);
+        return "ModRef"; // Default to MayAlias if query fails
+    }
+
+    MYSQL_RES* res = mysql_store_result(conn);
+    if (res == nullptr) {
+        std::cerr << "mysql_store_result() failed: " << mysql_error(conn) << "\n";
+        mysql_close(conn);
+        return "ModRef"; // Default to MayAlias if store result fails
+    }
+
+    MYSQL_ROW row = mysql_fetch_row(res);
+    std::string aaValue;
+    if (row) {
+      #ifdef DEBUG_PRINT
+        printf("Table count: %s\n", row[0]);
+      #endif
+    } else {
+        printf("No result.\n");
+    }
+    aaValue = parallel_query_tables(conn, baseName, key, row);
+    #ifdef DEBUG_PRINT_INTERPROCEDURAL
+    errs() << "Found sql entry: " << aaValue << "\n";
+    #endif
+    if(aaValue == ""){
+      errs() << "No result found in any table, defaulting to ModRef\n";
+      aaValue = "ModRef";
+    }
+    mysql_free_result(res);
+    mysql_close(conn);
+
+    return aaValue;
+}
+
+uint64_t GetMemId_Spec(Instruction *inst) {
+    // Generate a unique memory ID based on the instruction type and operands
+if (isa<LoadInst>(inst) || isa<StoreInst>(inst)) {
+      // Try to get the metadata node attached to this instruction
+      if (MDNode *Node = inst->getMetadata("mem_id")) {
+        // Check that the node has at least 2 operands
+        if (Node->getNumOperands() >= 2) {
+          Metadata *Op1 = Node->getOperand(1).get();
+
+          // Expecting a ConstantInt wrapped in ConstantAsMetadata
+          if (auto *ConstMD = dyn_cast<ConstantAsMetadata>(Op1)) {
+            if (auto *CI = dyn_cast<ConstantInt>(ConstMD->getValue())) {
+              uint64_t MemID = CI->getZExtValue();
+              // errs() << "Found mem_id = " << MemID << " on instruction: " << *inst << "\n";
+              return MemID; // Return the memory ID
+            }
+          }
+        }
+      }
+    }
+  // errs() << "No mem_id found for instruction: " << *inst << "\n";
+  return -1; // Default return value if no mem_id found
+}
+
+uint64_t GetMemId_Spec_calls(Instruction *inst) {
+    if (auto *Call = dyn_cast<CallInst>(inst)) {
+      #ifdef DEBUG_PRINT_INTERPROCEDURAL
+      errs() << "CallInst found: " << *Call << "\n";
+      #endif
+        if (MDNode *Node = Call->getMetadata("call_id")) {
+          #ifdef DEBUG_PRINT_INTERPROCEDURAL
+          errs() << "Found call_id metadata on instruction: " << *Call << "\n";
+          #endif
+            if (Node->getNumOperands() >= 2) {
+              #ifdef DEBUG_PRINT_INTERPROCEDURAL
+              errs() << "Metadata has sufficient operands\n";
+              #endif
+                if (auto *ConstMD = dyn_cast<ConstantAsMetadata>(Node->getOperand(1).get())) {
+                  #ifdef DEBUG_PRINT_INTERPROCEDURAL
+                  errs() << "Found call_id constant metadata: " << *ConstMD << "\n";
+                  #endif
+                    if (auto *CI = dyn_cast<ConstantInt>(ConstMD->getValue())) {
+                        #ifdef DEBUG_PRINT_INTERPROCEDURAL
+                        errs() << "Found call_id constant: " << *CI << "\n";
+                        #endif
+                        uint64_t CallId = CI->getZExtValue();
+                        #ifdef DEBUG_PRINT_INTERPROCEDURAL
+                        errs() << "Found call_id = " << CallId << " on instruction: " << *Call << "\n";
+                        #endif
+                        return CallId;
+                    }
+                }
+            }
+        }
+    }
+    return UINT64_MAX; // sentinel
+}
+
+/// Result type for pointer difference
+struct PtrDiffResult {
+    bool IsConstant;
+    APInt ConstantValue;     // valid if IsConstant == true
+    const SCEV *Symbolic;    // valid if IsConstant == false
+};
+
+PreservedAnalyses ReorderPass_Spec::runonFunction(Function &F, ModuleAnalysisManager &MAM, FunctionAnalysisManager &FAM) {
+  // auto &MAMProxy = AM.getResult<ModuleAnalysisManagerFunctionProxy>(F);
+  Module &M = *F.getParent();
+  std::string ModuleName = M.getName().str();
+  std::string FunctionName = F.getName().str();
+  AliasAnalysis &AA = FAM.getResult<AAManager>(F);
+  BasicAAResult &BasicAAR = FAM.getResult<BasicAA>(F);
+  auto &DA = FAM.getResult<DependenceAnalysis>(F);
+  auto &DL = F.getParent()->getDataLayout();
+  auto &SE = FAM.getResult<ScalarEvolutionAnalysis>(F);
+  LLVMContext &Context = F.getContext();
+  TargetLibraryInfo &TLI = FAM.getResult<TargetLibraryAnalysis>(F);
+  // GraphAAResult &GraphAAR = MAM.getResult<GraphAA>( *(F.getParent()));
+  auto &GlobalsAAR = MAM.getResult<GlobalsAA>( *(F.getParent()));
+  SimpleAAQueryInfo SimpleAAQI (AA);
+  std::vector<Instruction *> defChain;
+  SetVector <Instruction *> Int_ins;
+  SetVector <Instruction *> call_ins;
+  SetVector <Instruction *> Int_dep;
+  SetVector <Instruction *> useChain;
+  SetVector <Instruction *> prev_load_usechain;
+  SetVector <Instruction *> noDepChain;
+  Instruction *int_mem_op = nullptr;
+  Instruction *currentInst = nullptr;
+  LoadInst *prevLoadInst = nullptr;
+  std::queue<Instruction *> worklist;
+  std::queue<Instruction *> worklist_prev;
+  int distance = 0;
+    // Transfer elements from set to vector
+    //std::vector<Instruction *> tempVector(useChain.begin(), useChain.end());
+  int Val;
+  Instruction *startInst;
+  int wasted = 0;
+  int reorder = 0;
+  bool UseChain_contains_prevLoad = false;
+  bool UseChain_contains_currLoad = false;
+  bool Aliases_with_prevLoad = false;
+  bool Aliases_with_currLoad = false;
+  bool successfully_reordered = false;
+  bool contains_call_instruction = false;
+  bool store_detected_call = false;
+  bool call_inbetween = false; //comment
+  bool call_in_catalyst_mod_load = false;
+      for (auto &BB : F) {
+        LoadInst *prevLoadInst = nullptr;
+        call_inbetween = false; //comment
+        #ifdef DEBUG_PRINT
+        errs() << "next BB " << "\n";
+        errs() << "Analyzing Basic Block: " << BB.getName() << "\n";
+        #endif
+            BasicBlock::iterator it_bb = BB.begin();
+            // BasicBlock::iterator end = BB.end();
+            for(it_bb = BB.begin(); it_bb != BB.end();){
+              Instruction &I = *it_bb;
+              ++it_bb;
+              if(it_bb == BB.end() && prevLoadInst != nullptr){
+                #ifdef DEBUG_PRINT
+                errs() << "End of BB with pending prevLoadInst" << *prevLoadInst << "\n";
+                #endif
+                it_bb = prevLoadInst->getIterator();
+                ++it_bb;
+                prevLoadInst = nullptr;
+                continue;
+              }
+              if (isa<LoadInst>(&I)) {
+                if (I.getType()->isVectorTy() || I.isVolatile()) {
+                    #ifdef DEBUG_PRINT
+                    errs() << "Skipping vector load instruction: " << I << "\n";
+                    #endif
+                    continue;
+                }
+              }
+              if(isa<StoreInst>(&I)){
+                if (I.isVolatile()) {
+                    #ifdef DEBUG_PRINT
+                    errs() << "Skipping vector store instruction: " << I << "\n";
+                    #endif
+                    continue;
+                }
+              }
+              if(!EnableAcrossCallReordering_Spec && prevLoadInst != nullptr)
+              {
+                // errs() << "Encountered call instruction, resetting prevLoadInst " << dyn_cast<CallInst>(&I) << "\n";
+                // errs() << "PrevLoadInst before reset: " << *prevLoadInst << "\n";
+                if(isa<CallInst>(&I)){
+                  #ifdef DEBUG_PRINT
+                  errs() << "Encountered call instruction, resetting prevLoadInst" << *cast<CallInst>(&I) << "\n";
+                  #endif
+                  call_inbetween = true; //comment
+                  it_bb = prevLoadInst->getIterator();
+                  ++it_bb;
+                  prevLoadInst = nullptr;
+                  distance = 0;
+                  continue;
+                }
+              } 
+              else if(EnableAcrossCallReordering_Spec){
+                #ifdef DEBUG_PRINT
+                errs() << "Across call reordering enabled" << "\n";
+                #endif
+              }else{
+                if(isa<CallInst>(&I) && prevLoadInst != nullptr){
+                  // #ifdef DEBUG_PRINT
+                  errs() << "Unexpected condition in across call reordering\n";
+                  errs() << "PrevLoadInst: " << *prevLoadInst << "\n";
+                  errs() << "Call Instruction: " << *cast<CallInst>(&I) << "\n";
+                  // #endif
+                }
+              }
+        //for (auto &I : BB) {
+          if (LoadInst *loadInst = dyn_cast<LoadInst>(&I)) {
+            successfully_reordered = false;
+            // Print the def chain leading to the nextLoadInst
+            if (prevLoadInst) {
+              // successfully_reordered = false;
+              #ifdef DEBUG_PRINT
+              errs() << "Previous(Head) Load Instruction: " << *prevLoadInst << "\n";
+              #endif
+              #ifdef DEBUG_PRINT
+              errs() << "Found current(Tail) Load Instruction: " << *loadInst << "\n";
+              #endif
+              currentInst = loadInst;
+              startInst = prevLoadInst;
+              Value *curLoadPtr = loadInst->getPointerOperand();
+              Value *prevLoadPtr = prevLoadInst->getPointerOperand();
+              Type *ElemTyA = getLoadStoreType(loadInst);
+              // Value *scurLoadPtr = loadInst->getPointerOperand();
+              // Value *sprevLoadPtr = prevLoadInst->getPointerOperand();
+              // BasePointer_curLoadPtr = dyn_cast<SCEVUnknown>(curLoadPtr);
+              // BasePointer_prevLoadPtr = dyn_cast<SCEVUnknown>(prevLoadPtr);
+              #ifdef DEBUG_PRINT
+              errs() << "Tail load ptr :" << *curLoadPtr << " Head load ptr :" << *prevLoadPtr << "\n";
+              #endif
+              unsigned ASA = curLoadPtr->getType()->getPointerAddressSpace();
+              unsigned ASB = prevLoadPtr->getType()->getPointerAddressSpace();
+              // errs() << "Instructions ptr pointer :" << *BasePointer_curLoadPtr << " cur load base pointer :" << *BasePointer_prevLoadPtr << "\n";
+              APInt curloadOffset(DL.getIndexTypeSizeInBits(curLoadPtr->getType()), 0);
+              APInt prevloadOffset(DL.getIndexTypeSizeInBits(prevLoadPtr->getType()), 0);
+              Value *curLoadPtr_1 = curLoadPtr->stripAndAccumulateConstantOffsets(DL, curloadOffset, /* AllowNonInbounds */ true);
+              Value *prevLoadPtr_1 = prevLoadPtr->stripAndAccumulateConstantOffsets(DL, prevloadOffset, /* AllowNonInbounds */ true);
+              #ifdef DEBUG_PRINT
+              errs() << "Tail ptr strip cast:" << *curLoadPtr_1 << " Head ptr strip cast:" << *prevLoadPtr_1 << "\n";
+              #endif
+              if (curLoadPtr_1 == prevLoadPtr_1) {
+                // Retrieve the address space again as pointer stripping now tracks through
+                // `addrspacecast`.
+                ASA = cast<PointerType>(prevLoadPtr_1->getType())->getAddressSpace();
+                ASB = cast<PointerType>(curLoadPtr_1->getType())->getAddressSpace();
+                // Check that the address spaces match and that the pointers are valid.
+                if (ASA != ASB)
+                {
+                  #ifdef DEBUG_PRINT
+                  errs() << "Instructions no common base:" << *curLoadPtr_1 << " cur load base :" << *prevLoadPtr_1 << "\n";
+                  #endif
+                    currentInst = nullptr;
+                    loadInst = nullptr;
+                    it_bb++;
+                    continue;
+                }
+
+                unsigned IdxWidth = DL.getIndexSizeInBits(ASA);
+                curloadOffset = curloadOffset.sextOrTrunc(IdxWidth);
+                prevloadOffset = prevloadOffset.sextOrTrunc(IdxWidth);
+
+                curloadOffset -= prevloadOffset;
+                Val = curloadOffset.getSExtValue();
+                #ifdef DEBUG_PRINT
+                errs() << "Instructions val (from offsets):" << Val << "\n";
+                #endif
+              } else {
+                  // Otherwise compute the distance with SCEV between the base pointers.
+                  const SCEV *PtrSCEVA = SE.getSCEV(curLoadPtr);
+                  const SCEV *PtrSCEVB = SE.getSCEV(prevLoadPtr);
+                  const auto *Diff = dyn_cast<SCEVConstant>(SE.getMinusSCEV(PtrSCEVB, PtrSCEVA));
+                  if (!Diff){
+                    currentInst = nullptr;
+                    loadInst = nullptr;
+                    it_bb++;
+                    continue;
+                    // Val = Diff->getAPInt().getSExtValue(); 
+                    continue;
+                  }else{
+                    Val = Diff->getAPInt().getSExtValue();
+                    errs() << "Instructions scev val:" << Val << "\n";
+                  }
+                  // if(const SCEVConstant *C = dyn_cast<SCEVConstant>(Diff)){
+                  //   Val = Diff->getAPInt().getSExtValue();
+                  //   errs() << "Instructions scev val:" << Val << "\n";
+                  // }else{
+                  //   currentInst = nullptr;
+                  //   loadInst = nullptr;
+                  //   it_bb++;
+                  //   continue;
+                  // }
+              }
+              int Size = DL.getTypeStoreSize(ElemTyA);
+              int Dist = Val / 64; // 64 is the cache line size
+              #ifdef DEBUG_PRINT
+              errs() << "Instructions val:" << Val << "\n";
+              errs() << "Instructions Dist:" << Dist << "\n";
+              #endif
+              if(std::abs(Dist) >= 2){
+                // errs() << "Instructions Alias curLoad: " << *loadInst << " prev load :" << *prevLoadInst << "\n";
+                currentInst = nullptr;
+                loadInst = nullptr;
+                it_bb++;
+                continue;
+              }
+              // errs() << "Instructions no Alias curLoad: " << *loadInst << " prev load :" << *prevLoadInst << "\n";
+              // if (curLoadPtr != prevLoadPtr){
+              //   loadInst = nullptr;
+              //   currentInst = nullptr;
+              //   errs() << "Instructions doesn't have same base, prev load base: " << curLoadPtr << " cur load base :" << prevLoadPtr << "\n";
+              //   continue;
+              // }
+              // errs() << "Instructions have same base, prev load base: " << curLoadPtr << " cur load base :" << prevLoadPtr << "\n";
+
+              // auto CurLoadAccessSize = LocationSize::precise(DL.getTypeStoreSize(curLoadPtr->getType()));
+              // auto PrevLoadAccessSize = LocationSize::precise(DL.getTypeStoreSize(prevLoadPtr->getType()));
+              
+              // APInt offsetdiff = (curloadOffset + CurLoadAccessSize.toRaw()) - (prevloadOffset + PrevLoadAccessSize.toRaw());
+              // APInt curloadStartaddress = curloadOffset;
+              // APInt prevloadStartaddress = prevloadOffset;
+              // APInt curloadEndaddress = curloadOffset + CurLoadAccessSize.toRaw();
+              // APInt prevloadEndaddress = prevloadOffset + PrevLoadAccessSize.toRaw();
+              // if(isContiguous(curloadStartaddress, CurLoadAccessSize.toRaw(), prevloadStartaddress, PrevLoadAccessSize.toRaw()) || isSameLine(curloadStartaddress, curloadEndaddress, prevloadStartaddress, prevloadEndaddress) || isNextLine(curloadStartaddress, curloadEndaddress, prevloadStartaddress, prevloadEndaddress) || isOneLineApart(curloadStartaddress, curloadEndaddress, prevloadStartaddress, prevloadEndaddress)){
+              //   errs() << "yay! diff:" << offsetdiff << "\n";
+              // }else{
+              //   currentInst = nullptr;
+              //   loadInst = nullptr;
+              //   errs() << "Looking for next load to fuse this: " << *prevLoadInst << "Cur load" << *loadInst << "\n";
+              //   continue;
+              // }
+              // auto curloadAccessSize = LocationSize::precise(DL.getTypeStoreSize(StoreTy));
+              // ConstantRange LoadRange(LoadOffset, LoadOffset + LoadAccessSize.toRaw());
+              // ConstantRange StoreRange(StoreOffset, StoreOffset + StoreAccessSize.toRaw());  
+              errs() << "Def Chain leading to: " << *loadInst << "\n";
+              errs() << "Prev load Inst: " << *prevLoadInst << "\n";
+                while (currentInst && currentInst != startInst) {
+                    defChain.push_back(currentInst);
+                    Int_ins.insert(currentInst);
+                    currentInst = currentInst->getPrevNode();
+                }
+
+                if (currentInst == startInst) {
+                    defChain.push_back(currentInst);
+                    Int_ins.insert(currentInst);
+
+                    //Print the def chain in reverse order
+                    for (auto it = defChain.rbegin(); it != defChain.rend(); ++it){
+                      #ifdef DEBUG_PRINT
+                      errs() << "Instructions in between" << *(*it) << "\n";
+                      #endif
+                      
+                      distance++;
+                       if(dyn_cast<CallInst>(*it)){
+                        if(CallInst *callInst = dyn_cast<CallInst>(*it)){
+                          assert(EnableAcrossCallReordering_Spec && "Across call reordering should be enabled");
+                            // if(!EnableAcrossCallReordering_Spec){
+                            //   call_in_catalyst_mod_load = true;
+                            //   errs() << "Across call reordering not enabled, cannot reorder across calls" << "\n";
+                            //   break;
+                            // }
+                            // callInst->mayThrow();
+                            ModRefInfo DefMRI_tail = AA.getModRefInfo(callInst, MemoryLocation::get(loadInst), SimpleAAQI);
+                            ModRefInfo BasicMRI_tail = BasicAAR.getModRefInfo(callInst, MemoryLocation::get(loadInst), SimpleAAQI);
+                            //ModRefInfo GraphMRI_tail = GraphAAR.getModRefInfo(callInst, MemoryLocation::get(loadInst), SimpleAAQI);
+                            ModRefInfo DefMRI_head = AA.getModRefInfo(callInst, MemoryLocation::get(prevLoadInst), SimpleAAQI);
+                            ModRefInfo BasicMRI_head = BasicAAR.getModRefInfo(callInst, MemoryLocation::get(prevLoadInst), SimpleAAQI); 
+                            ModRefInfo GlobalsMRI_head = GlobalsAAR.getModRefInfo(callInst, MemoryLocation::get(prevLoadInst), SimpleAAQI);   
+                            ModRefInfo GlobalsMRI_tail = GlobalsAAR.getModRefInfo(callInst, MemoryLocation::get(loadInst), SimpleAAQI);                       
+                            //ModRefInfo GraphMRI_head = GraphAAR.getModRefInfo(callInst, MemoryLocation::get(prevLoadInst), SimpleAAQI);
+                            ModRefInfo GraphDefMRI_tail = (DefMRI_tail == ModRefInfo::ModRef) ? (BasicMRI_tail == ModRefInfo::ModRef ? BasicMRI_tail : GlobalsMRI_tail) : DefMRI_tail;
+                            ModRefInfo GraphDefMRI_head = (DefMRI_head == ModRefInfo::ModRef) ? (BasicMRI_head == ModRefInfo::ModRef ? BasicMRI_head : GlobalsMRI_head) : DefMRI_head;
+                            if(EnablePrecomputedAliasResults_interprocedural){
+                              uint64_t call_id = GetMemId_Spec_calls(callInst);
+                              uint64_t load_id_tail = GetMemId_Spec(loadInst);
+                              std::string result_tail = "NoModRef";//fetchAAByPrimaryKey_Spec_interprocedural(std::to_string(call_id), std::to_string(load_id_tail), ModuleName, FunctionName);
+                              uint64_t load_id_head = GetMemId_Spec(prevLoadInst);
+                              std::string result_head = "NoModRef";//fetchAAByPrimaryKey_Spec_interprocedural(std::to_string(call_id), std::to_string(load_id_head), ModuleName, FunctionName);
+                              ModRefInfo SVF_head = (result_head == "NoModRef" ? ModRefInfo::NoModRef : ModRefInfo::ModRef); 
+                              ModRefInfo SVF_tail = (result_tail == "NoModRef" ? ModRefInfo::NoModRef : ModRefInfo::ModRef);
+                              GraphDefMRI_tail = (GraphDefMRI_tail != ModRefInfo::NoModRef) ? SVF_tail : GraphDefMRI_tail;
+                              GraphDefMRI_head = (GraphDefMRI_head != ModRefInfo::NoModRef) ? SVF_head : GraphDefMRI_head;
+                              #ifdef DEBUG_PRINT
+                              errs() << "SVF Interprocedural analysis: " << GraphDefMRI_head << " tail: " << GraphDefMRI_tail << "\n";
+                              #endif
+                              #ifdef DEBUG_PRINT
+                              errs() << "Using precomputed alias results" << "\n";
+                              errs() << "Tail Load get ID: " << loadInst->getValueID() << " (" << *loadInst << ")\n";
+                              #endif
+                              uint64_t loadMemId = GetMemId_Spec(loadInst);
+                              #ifdef DEBUG_PRINT
+                              errs() << "Head Prev get ID: " << prevLoadInst->getValueID() << " (" << *prevLoadInst << ")\n";
+                              #endif
+                            }
+                          #ifdef DEBUG_PRINT
+                          errs() << "Call Inbetween" << "\n";
+                          errs() << "Across call reordering enabled" << "\n";
+                          errs() << "Chained Interprocedural" << "\n";
+                          #endif
+                          if(GraphDefMRI_head != ModRefInfo::NoModRef || callInst->isVolatile() || callInst->mayThrow() || callInst->mayHaveSideEffects()){
+                            call_in_catalyst_mod_load = true;
+                            errs() << GraphDefMRI_head << "\n";
+                            #ifdef DEBUG_PRINT
+                            errs() << "Call modifies or references memory for head load" << "\n";
+                            #endif
+                            break;
+                          }
+                        }
+                      }
+                    }
+                    if(call_in_catalyst_mod_load){
+                      distance = 0;
+                      globalAcrossCallWasted_Spec++;
+                      run_globalAcrossCallWasted_Spec++;
+                      call_in_catalyst_mod_load = false;
+                      currentInst = nullptr;
+                      loadInst = nullptr;
+                      it_bb = prevLoadInst->getIterator();
+                      ++it_bb;
+                      prevLoadInst = nullptr;
+                      distance = 0;
+                      defChain.clear();
+                      Int_ins.clear();
+                      continue;
+                    }
+                    if((distance -2) > ReorderDistance_Spec){
+                      currentInst = nullptr;
+                      loadInst = nullptr;
+                      it_bb = prevLoadInst->getIterator();
+                      ++it_bb;
+                      prevLoadInst = nullptr;
+                      distance = 0;
+                      defChain.clear();
+                      Int_ins.clear();
+                      continue;
+                    }
+                  
+                    for (auto it = Int_ins.rbegin(); it != Int_ins.rend(); ++it){
+                      #ifdef DEBUG_PRINT
+                      errs() << "Def Chain Instruction: " << *(*it) << "\n";
+                      #endif
+                      //errs() << "Instructions in between" << *(*it) << "\n";
+                      if (isa<StoreInst>(*it)){//&& (DA.depends(*it, startInst, true))){ 
+                        int_mem_op =  dyn_cast<StoreInst>(*it);
+                        #ifdef DEBUG_PRINT
+                        errs() << "Found Store Instruction in between: " << *int_mem_op << "\n";
+                        #endif
+                        // errs() << "Int mem op: " << *int_mem_op << "\n";
+                        if(!EnableSpeculativeReordering_Spec){
+                          #ifdef DEBUG_PRINT
+                          errs() << "Non Speculative reordering" << "\n";
+                          #endif
+                          AliasResult AR = AA.alias(MemoryLocation::get(loadInst),MemoryLocation::get(cast<StoreInst>(*it)));
+                          AliasResult AR2 = AA.alias(MemoryLocation::get(prevLoadInst),MemoryLocation::get(cast<StoreInst>(*it)));
+                          AliasResult AR_tail = AR;//GraphAAR.alias(MemoryLocation::get(loadInst), MemoryLocation::get(cast<StoreInst>(*it)), SimpleAAQI, nullptr);
+                          AliasResult AR_head = AR2;//GraphAAR.alias(MemoryLocation::get(prevLoadInst), MemoryLocation::get(cast<StoreInst>(*it)), SimpleAAQI, nullptr);
+                                // assert((AR_tail != AliasResult::NoAlias) || (AR != AliasResult::MustAlias && AR != AliasResult::PartialAlias)
+                                //   && "Contradiction tail node in results between graph-aa and default-aa-pipeline."
+                                // );
+                                // assert((AR_head != AliasResult::NoAlias) || (AR != AliasResult::MustAlias && AR != AliasResult::PartialAlias)
+                                //   && "Contradiction head node in results between graph-aa and default-aa-pipeline."
+                                // );
+                          AliasResult AA_final_tail = AR;
+                          AliasResult AA_final_head = AR2;
+                          if(EnablePrecomputedAliasResults) {
+                            // Get variable names for querying
+                            #ifdef DEBUG_PRINT
+                            errs() << "Using precomputed alias results" << "\n";
+                            errs() << "Tail Load get ID: " << loadInst->getValueID() << " (" << loadInst << ")\n";
+                            #endif
+                            uint64_t loadMemId = GetMemId_Spec(loadInst);
+                            #ifdef DEBUG_PRINT
+                            errs() << "Head Prev get ID: " << prevLoadInst->getValueID() << " (" << prevLoadInst << ")\n";
+                            #endif
+                            uint64_t prevLoadMemId = GetMemId_Spec(prevLoadInst);
+                            uint64_t storeMemId = GetMemId_Spec(cast<StoreInst>(*it));
+                            #ifdef DEBUG_PRINT
+                            errs() << "Catalyst Store get ID: " << cast<StoreInst>(*it)->getValueID() << " (" << cast<StoreInst>(*it) << ")\n";
+                            errs() << "Tail Load ID: " << loadMemId << " (" << loadInst << ")\n";
+                            errs() << "Head Prev Load ID: " << prevLoadMemId << " (" << prevLoadInst << ")\n";
+                            errs() << "Catalyst Store ID: " << storeMemId << " (" << cast<StoreInst>(*it) << ")\n";
+                            #endif
+                            // Query precomputed results
+                            std::string result_tail = fetchAAByPrimaryKey_Spec_multiple(std::to_string(loadMemId), std::to_string(storeMemId), ModuleName, FunctionName);
+                            std::string result_head = fetchAAByPrimaryKey_Spec_multiple(std::to_string(prevLoadMemId), std::to_string(storeMemId), ModuleName, FunctionName);
+                            // if(result_tail == "" || result_head == ""){
+                            //   assert(false && "Precomputed alias results not found for the given pointers");
+                            // }
+                            #ifdef DEBUG_PRINT
+                            errs() << "Precomputed result tail: " << result_tail << "\n";
+                            errs() << "Precomputed result head: " << result_head << "\n";
+                            #endif
+                            AliasResult precomputedResult_tail = (result_tail == "NoAlias") ? AliasResult::NoAlias : AliasResult::MayAlias;
+                            AliasResult precomputedResults_head = (result_head == "NoAlias") ? AliasResult::NoAlias : AliasResult::MayAlias;
+                            AA_final_tail = (AR == AliasResult::MayAlias) ? precomputedResult_tail : AR;
+                            AA_final_head = (AR2 == AliasResult::MayAlias) ? precomputedResults_head : AR2;
+                            if(AR == AliasResult::MayAlias){
+                              if(AA_final_tail == AliasResult::NoAlias || AA_final_tail == AliasResult::MustAlias){
+                                #ifdef DEBUG_PRINT
+                                errs() << "SVF helped in reordering decision for tail load" << "\n";
+                                #endif
+                                globaldiffchainedsvfgraphaa_Spec++;
+                                run_globaldiffchainedsvfgraphaa_Spec++;
+                                run_intra_aa_svf_diff_SpecLoad++;
+                              }
+                            }
+                            if(AR2 == AliasResult::MayAlias){
+                              if(AA_final_head == AliasResult::NoAlias || AA_final_head == AliasResult::MustAlias){
+                                #ifdef DEBUG_PRINT
+                                errs() << "SVF helped in reordering decision for head load" << "\n";
+                                #endif
+                                globaldiffchainedsvfgraphaa_Spec++;
+                                run_globaldiffchainedsvfgraphaa_Spec++;
+                                run_intra_aa_svf_diff_SpecLoad++;
+                              }
+                            }
+                          }else if(ChainGraphaawithSVF) {
+                            // Get variable names for querying
+                            errs() << "Using precomputed alias and GraphAA results" << "\n";
+                            uint64_t loadMemId = GetMemId_Spec(loadInst);
+                            uint64_t prevLoadMemId = GetMemId_Spec(prevLoadInst);
+                            uint64_t storeMemId = GetMemId_Spec(cast<StoreInst>(*it));
+                            errs() << "Load ID: " << loadMemId << " (" << loadInst << ")\n";
+                            errs() << "Prev Load ID: " << prevLoadMemId << " (" << prevLoadInst << ")\n";
+                            errs() << "Store ID: " << storeMemId << " (" << cast<StoreInst>(*it) << ")\n";
+                            // Query precomputed results
+                            std::string result_tail = fetchAAByPrimaryKey_Spec_multiple(std::to_string(loadMemId), std::to_string(storeMemId), ModuleName, FunctionName);
+                            std::string result_head = fetchAAByPrimaryKey_Spec_multiple(std::to_string(prevLoadMemId), std::to_string(storeMemId), ModuleName, FunctionName);
+
+                            if(result_tail == "" || result_head == ""){
+                              assert(false && "Precomputed alias results not found for the given pointers");
+                            }
+                            errs() << "Precomputed result tail: " << result_tail << "\n";
+                            errs() << "Precomputed result head: " << result_head << "\n";
+                            AliasResult precomputedResult_tail = (result_tail == "NoAlias") ? AliasResult::NoAlias : AliasResult::MayAlias;
+                            AliasResult precomputedResults_head = (result_head == "NoAlias") ? AliasResult::NoAlias : AliasResult::MayAlias;
+                            AA_final_tail = (AR == AliasResult::MayAlias) ? precomputedResult_tail : AR;
+                            AA_final_head = (AR2 == AliasResult::MayAlias) ? precomputedResults_head : AR2;
+                            if(AR == AliasResult::MayAlias){
+                              if(AR_tail == AliasResult::NoAlias || AR_tail == AliasResult::MustAlias){
+                                globaldiffchainedsvfgraphaa_Spec++;
+                                run_globaldiffchainedsvfgraphaa_Spec++;
+                                run_intra_aa_svf_diff_SpecLoad++;
+                              }
+                            }
+                            if(AR2 == AliasResult::MayAlias){
+                              if(AR_head == AliasResult::NoAlias || AR_head == AliasResult::MustAlias){
+                                globaldiffchainedsvfgraphaa_Spec++;
+                                run_globaldiffchainedsvfgraphaa_Spec++;
+                                run_intra_aa_svf_diff_SpecLoad++;
+                              }
+                            }
+                          } else if(EnableGraphAA) {
+                            AA_final_tail = (AR == AliasResult::MayAlias) ? AR_tail : AR;//AR;//(AR_tail == AliasResult::MayAlias) ? AR : AR_tail;
+                            AA_final_head = (AR2 == AliasResult::MayAlias) ? AR_head : AR2;//AR2;//(AR_head == AliasResult::MayAlias) ? AR2 : AR_head;
+                            if(AR == AliasResult::MayAlias){
+                              if(AR_tail == AliasResult::NoAlias || AR_tail == AliasResult::MustAlias){
+                                globaldiffchainedgraphaa_Spec++;
+                                run_globaldiffchainedgraphaa_Spec++;
+                                run_intra_aa_svf_diff_SpecLoad++;
+                              }
+                            }
+                            if(AR2 == AliasResult::MayAlias){
+                              if(AR_head == AliasResult::NoAlias || AR_head == AliasResult::MustAlias){
+                                globaldiffchainedgraphaa_Spec++;
+                                run_intra_aa_svf_diff_SpecLoad++;
+                              }
+                            }
+                          } else {
+                            errs() << "SVF and Graph AA not enabled" << "\n";
+                            AA_final_tail = AR;
+                            AA_final_head = AR2;
+                          }
+                          #ifdef DEBUG_PRINT
+                          errs() << "AA results tail: " << AA_final_tail << "\n";
+                          errs() << "AA results head: " << AA_final_head << "\n";
+                          #endif
+                          if ((AA_final_tail == AliasResult::MayAlias || AA_final_tail == AliasResult::MustAlias) && (AA_final_head == AliasResult::MayAlias || AA_final_head == AliasResult::MustAlias)) {
+                              Int_ins.clear();
+                              wasted++;
+                              Aliases_with_currLoad = true;
+                              Aliases_with_prevLoad = true;
+                              #ifdef DEBUG_PRINT
+                              errs() << "Both Loads Alias with Store, cannot reorder" << "\n";
+                              #endif
+                              // errs() << "Catalyst Store Aliases with prevload: " << "True" << "\n";
+                              // errs() << "Catalyst Store Aliases with load: " << "True" << "\n";
+                              distance = 0;
+                              it_bb = prevLoadInst->getIterator();
+                              ++it_bb;
+                              prevLoadInst = nullptr;
+                              currentInst = nullptr;
+                              loadInst = nullptr;
+                              break;
+                          } else if ((AA_final_tail == AliasResult::MayAlias ||
+                                      AA_final_tail == AliasResult::MustAlias) &&
+                                    (AA_final_head != AliasResult::MayAlias &&
+                                      AA_final_head != AliasResult::MustAlias)) {
+                              wasted++;
+                              Aliases_with_currLoad = true;
+                              Aliases_with_prevLoad = false;
+                              #ifdef DEBUG_PRINT
+                              errs() << "Tail Load Aliases with Store, cannot reorder" << "\n";
+                              #endif
+                              // errs() << "Catalyst Store Aliases with prevload: " << "False" << "\n";
+                              // errs() << "Catalyst Store Aliases with load: " << "True" << "\n";
+                              distance = 0;
+                              it_bb = prevLoadInst->getIterator();
+                              ++it_bb;
+                              prevLoadInst = nullptr;
+                              currentInst = nullptr;
+                              loadInst = nullptr;
+                              break;
+                          } else if ((AA_final_tail != AliasResult::MayAlias &&
+                                      AA_final_tail != AliasResult::MustAlias) &&
+                                    (AA_final_head == AliasResult::MayAlias ||
+                                      AA_final_head == AliasResult::MustAlias)) {
+                              Aliases_with_currLoad = false;
+                              Aliases_with_prevLoad = true;
+                              #ifdef DEBUG_PRINT
+                              errs() << "Head Load Aliases with Store, Tail load doesn't Alias so we can reorder" << "\n";
+                              #endif
+                              // errs() << "Catalyst Store Aliases with prevload: " << "True" << "\n";
+                              // errs() << "Catalyst Store Aliases with load: " << "False" << "\n";
+                          } else if ((AA_final_tail != AliasResult::MayAlias &&
+                                      AA_final_tail != AliasResult::MustAlias) &&
+                                    (AA_final_head != AliasResult::MayAlias &&
+                                      AA_final_head != AliasResult::MustAlias)) {
+                              Aliases_with_currLoad = false;
+                              Aliases_with_prevLoad = false;
+                              #ifdef DEBUG_PRINT
+                              errs() << "Both Loads doesn't Alias with Store, can reorder" << "\n";
+                              #endif
+                              // errs() << "Catalyst Store Aliases with prevload: " << "False" << "\n";
+                              // errs() << "Catalyst Store Aliases with load: " << "False" << "\n";
+                          }
+                          #ifdef DEBUG_PRINT
+                          errs() << "Non Speculative reordering done" << "\n";
+                          if((AA_final_tail == AliasResult:: MayAlias)){
+                            errs() << "Catalyst Store Aliases with tail load: " << "May Alias" << "\n";
+                          }
+
+                          if((AA_final_tail == AliasResult:: MayAlias)){
+                            errs() << "Catalyst Store Aliases with head load: " << "May Alias" << "\n";
+                          }
+                          #endif 
+                        } else {
+                          errs() << "Speculative reordering" << "\n";
+                          AliasResult AR = AA.alias(MemoryLocation::get(loadInst),MemoryLocation::get(cast<StoreInst>(*it)));
+                          AliasResult AR2 = AA.alias(MemoryLocation::get(prevLoadInst),MemoryLocation::get(cast<StoreInst>(*it)));
+                            if ((AR == AliasResult::MustAlias) &&
+                              (AR2 == AliasResult::MustAlias)) {
+                              Int_ins.clear();
+                              wasted++;
+                              run_globalWasted_Spec++;
+                              Aliases_with_currLoad = true;
+                              Aliases_with_prevLoad = true;
+                              errs() << "Catalyst Store Aliases with prevload: " << "True" << "\n";
+                              errs() << "Catalyst Store Aliases with load: " << "True" << "\n";
+                              distance = 0;
+                              it_bb = prevLoadInst->getIterator();
+                              ++it_bb;
+                              prevLoadInst = nullptr;
+                              currentInst = nullptr;
+                              loadInst = nullptr;
+                              break;
+                          } else if ((AR == AliasResult::MustAlias) &&
+                                    (AR2 != AliasResult::MustAlias)) {
+                              Aliases_with_currLoad = true;
+                              Aliases_with_prevLoad = false;
+                              errs() << "Catalyst Store Aliases with prevload: " << "False" << "\n";
+                              errs() << "Catalyst Store Aliases with load: " << "True" << "\n";
+                              distance = 0;
+                              it_bb = prevLoadInst->getIterator();
+                              ++it_bb;
+                              prevLoadInst = nullptr;
+                              currentInst = nullptr;
+                              loadInst = nullptr;
+                              break;
+                          } else if ((AR != AliasResult::MustAlias) &&
+                                    (AR2 == AliasResult::MustAlias)) {
+                              Aliases_with_currLoad = false;
+                              Aliases_with_prevLoad = true;
+                              errs() << "Catalyst Store Aliases with prevload: " << "True" << "\n";
+                              errs() << "Catalyst Store Aliases with load: " << "False" << "\n";
+                          } else if ((
+                                      AR != AliasResult::MustAlias) &&
+                                    (AR2 != AliasResult::MustAlias)) {
+                              Aliases_with_currLoad = false;
+                              Aliases_with_prevLoad = false;
+                              errs() << "Catalyst Store Aliases with prevload: " << "False" << "\n";
+                              errs() << "Catalyst Store Aliases with load: " << "False" << "\n";
+                          } 
+                          if((AR == AliasResult:: MayAlias)){
+                            errs() << "Catalyst Store Aliases with load: " << "May Alias" << "\n";
+                          }
+
+                          if((AR2 == AliasResult:: MayAlias)){
+                            errs() << "Catalyst Store Aliases with prevload: " << "May Alias" << "\n";
+                          }
+                        }
+                      } else if(Instruction *LI = dyn_cast<LoadInst>(*it)){
+                        // for (Use &U : LI->operands()) {
+                        //   Value *v = U.get();
+                        //   //Value *def = LI->getPointerOperand();
+                        //   if(Instruction *LI2 = dyn_cast<Instruction>(v) ){
+                        //     errs() << "Def: " << *LI2 << "\n";
+                        //     if(!Int_ins.contains(LI2) && LI == loadInst){
+                        //       loadInst->moveAfter(prevLoadInst);
+                        //       reorder++;
+                        //       //collectUseChain(loadInst, useChain);
+                        //       errs() << "Use Chain for: " << *loadInst << "\n";
+                        //       for (Instruction *inst : useChain) {
+                        //         errs() << *inst << "\n";
+                        //       }
+                        //       errs() << "Def doesn't contain: " << *LI2 << "\n";
+                        //     }
+                        //   }
+                        // }
+                        #ifdef DEBUG_DISTANCE
+                          errs() << "Distance" << (distance -2) << "\n";
+                        #endif
+                        if(LI == loadInst){
+                          worklist.push(LI);
+                          worklist_prev.push(prevLoadInst);
+                          while (!worklist.empty()) { 
+                            Instruction *inst = worklist.front();
+                            Instruction *prev_ins_users = prevLoadInst;
+                            worklist.pop();
+                            // Add the instruction to the use chain set
+                            // useChain.insert(inst);
+                            if(useChain.contains(inst))
+                            {
+                              useChain.remove(inst);
+                              useChain.insert(inst);
+                            }else{
+                              useChain.insert(inst);                                
+                            }
+                            //errs() << "Int pop: " << *inst << "\n";
+                            //errs() << "Int pop: " << inst << "\n";
+                            if (inst == prevLoadInst) {
+                              // Stop collecting the use chain at prevLoadInst
+                              //UseChain_contains_prevLoad = true;
+                              continue;
+                            }
+                            // Iterate over the operands of the instruction
+                            for (Use &operand : inst->operands()) {
+                              for (Use &U : operand->uses()) {
+                                //User *v = U.getUser();
+                                Value *v = U.get();
+                              if (Instruction *LI2 = dyn_cast<Instruction>(v)) {
+                                //errs() << "X" << "\n";
+                                //errs() << "Int use: " << *LI2 << "\n";
+                                if (Int_ins.contains(LI2) && LI == loadInst) {
+                                  //errs() << "Y" << "\n";
+                                  //errs() << "Int check: " << *LI2 << "\n";
+                                  //loadInst->moveAfter(prevLoadInst);
+                                  // Add the operand instruction to the worklist
+                                  worklist.push(LI2);
+                                  if(useChain.contains(prevLoadInst)){ //Int_ins.contains(LI2) && inst == prevLoadInst
+                                    UseChain_contains_prevLoad = true;
+                                  }
+                                } else if(!Int_ins.contains(LI2) && LI == loadInst){
+                                  //std::queue<Instruction *>().swap(worklist);
+                                  continue;
+                                }
+                              }
+                            }
+                            }
+                          }
+
+                          while (!worklist_prev.empty()) {
+                            Instruction *inst = worklist_prev.front();
+                            Instruction *prev_ins_users = prevLoadInst;
+                            worklist_prev.pop();
+
+                            // Add the instruction to the use chain set
+                            prev_load_usechain.insert(inst);
+                            //errs() << "Int pop: " << *inst << "\n";
+                            //errs() << "Int pop: " << inst << "\n";
+                            if (inst == loadInst) {
+                              // Stop collecting the use chain at prevLoadInst
+                              //UseChain_contains_prevLoad = true;
+                              continue;
+                            }
+                            
+                            for (User *U : inst->users()) {
+                              if (Instruction *useInst = dyn_cast<Instruction>(U)) {
+                                if (Int_ins.contains(useInst) && LI == loadInst) {
+                                  #ifdef DEBUG_PRINT
+                                  errs() << "Prev use: " << *useInst << "\n";
+                                  #endif
+                                  worklist_prev.push(useInst);
+                                  if(prev_load_usechain.contains(loadInst)){ //Int_ins.contains(LI2) && inst == prevLoadInst
+                                          UseChain_contains_currLoad = true;
+                                  }
+                                }
+                              }
+                            }
+                          }
+
+                          for (Instruction *I :Int_ins){
+                            if(!prev_load_usechain.contains(I) && !useChain.contains(I)){
+                              noDepChain.insert(I);
+                              #ifdef DEBUG_PRINT
+                              errs() << "No Dep: " << *I << "\n";
+                              #endif
+                            }
+                          }
+                          if(useChain.contains(prevLoadInst)){ //Int_ins.contains(LI2) && inst == prevLoadInst
+                            UseChain_contains_prevLoad = true;
+                          }
+
+                          if(prev_load_usechain.contains(loadInst)){
+                            UseChain_contains_currLoad = true;
+                          }
+                          
+                          #ifdef DEBUG_PRINT
+                          if(UseChain_contains_prevLoad){
+                            errs() << "PrevLoad in the UseChain: " << "True" << "\n";
+                          }else{
+                            errs() << "PrevLoad in the UseChain: " << "False" << "\n";
+                          }
+
+                          if(UseChain_contains_currLoad){
+                            errs() << "curLoad in the Prev Load UseChain: " << "True" << "\n";
+                          }else{
+                            errs() << "curLoad in the Prev Load UseChain: " << "False" << "\n";
+                          }
+                          #endif
+                          if(LI == loadInst){
+                            #ifdef DEBUG_PRINT
+                            errs() << "Use Chain for tail load: " << *loadInst << "\n";
+                            for (auto it = useChain.rbegin(); it != useChain.rend(); ++it) {//for (Instruction *inst : useChain) {
+                              Instruction *inst = *it;
+                              errs() << "Inst in Use Chain for tail load: " << *inst << "\n";
+                            }
+                            #endif
+                            if(UseChain_contains_prevLoad){
+                              for (Instruction *inst : useChain) {//for (auto it = useChain.rbegin(); it != useChain.rend(); ++it) {
+                                //Instruction *inst = *it;
+                              // Process each instruction in reverse order
+                                if(inst != prevLoadInst && UseChain_contains_prevLoad){
+                                  #ifdef DEBUG_PRINT
+                                  errs() << "Ins move after tail Load: " << *inst << "\n";
+                                  #endif
+                                  //inst->moveAfter(prevLoadInst); //TODO
+                                }
+                              }
+                            }else{
+                              for (auto it = useChain.rbegin(); it != useChain.rend(); ++it) {
+                                Instruction *inst = *it;
+                              //for (Instruction *inst : useChain) {
+                                if(inst != prevLoadInst && inst == loadInst && !UseChain_contains_prevLoad){
+                                  successfully_reordered = true;
+                                  reorder++;
+                                  inst->moveAfter(prevLoadInst);
+                                  #ifdef DEBUG_PRINT
+                                  errs() << "Ins move after Tail Load: " << *inst << "\n";
+                                  #endif
+                                } else if(inst != prevLoadInst && inst != loadInst && !UseChain_contains_prevLoad && !Aliases_with_currLoad){
+                                  inst->moveBefore(prevLoadInst);
+                                  #ifdef DEBUG_PRINT
+                                  errs() << "Ins move before Tail Load: " << *inst << "\n";
+                                  #endif
+                                }  
+                              }
+                            } 
+                          }
+                          #ifdef DEBUG_PRINT
+                          if(LI == loadInst){
+                            errs() << "User Chain for: " << *prevLoadInst << "\n";
+                            for (auto it = prev_load_usechain.rbegin(); it != prev_load_usechain.rend(); ++it) {//for (Instruction *inst : useChain) {
+                              Instruction *inst = *it;
+                              errs() << "Inst in Pre Load Use Chain" << *inst << "\n";
+                            }
+                          }
+                          #endif
+                        }
+
+                      }
+                    }
+                }
+              if(successfully_reordered){
+                it_bb = ++loadInst->getIterator();
+                prevLoadInst = nullptr;
+                call_inbetween = false; //comment
+                successfully_reordered = false;
+                currentInst = nullptr;
+                loadInst = nullptr;
+                globalReorder_Spec++;
+                run_globalReorder_Spec++;
+                distance = 0;
+              }else {
+                currentInst = nullptr;
+                loadInst = nullptr;
+                it_bb++;
+                globalWasted_Spec++;
+                run_globalWasted_Spec++;
+              }
+              if(UseChain_contains_prevLoad){
+                distance = 0;
+              }
+              #ifdef DEBUG_PRINT
+              errs() << "--------" << "\n";
+              errs() << "Resetting for next load" << "\n";
+              errs() << "--------" << "\n";
+              errs() << "\n";
+              #endif
+              defChain.clear();
+              Int_ins.clear();
+              Int_dep.clear();
+              useChain.clear();
+              call_inbetween = false; //comment
+              prev_load_usechain.clear();
+              noDepChain.clear();
+              UseChain_contains_prevLoad = false;
+              Aliases_with_prevLoad = false;
+              Aliases_with_currLoad = false;
+              std::queue<Instruction *>().swap(worklist);
+            }else{
+              prevLoadInst = loadInst;
+            }
+            // if(successfully_reordered){
+            //     prevLoadInst = nullptr;
+            //     currentInst = nullptr;
+            //     loadInst = nullptr;
+            //     call_inbetween = false; //comment
+            //     distance = 0;
+            //   }else{
+            //     currentInst = nullptr;
+            //     loadInst = nullptr;
+            //     it_bb++;
+            //   }
+              // if(!prevLoadInst){
+              //   prevLoadInst = loadInst;
+              // }
+          }
+          else if(CallInst *callinst = dyn_cast<CallInst>(&I)){
+            call_ins.clear();
+            if(!loadInst && prevLoadInst){
+              #ifdef DEBUG_PRINT
+              errs() << "Call Inst:" << I << "\n";
+              #endif
+              contains_call_instruction = true;
+              Function *parentFunc = callinst->getFunction();
+              if (CallInst *callInst = dyn_cast<CallInst>(&I)) {
+                // Analyze instructions within the called function
+                Function *calledFunc = callInst->getCalledFunction();
+                if (calledFunc && !calledFunc->isDeclaration()) {
+                    // Look for potential aliasing stores in the called function
+                    for (BasicBlock &calledBB : *calledFunc) {
+                        for (Instruction &calledI : calledBB) {
+                          call_ins.insert(&calledI);
+                        }
+                      }
+                }
+              }
+            }
+          }
+        }
+      }
+      #ifdef DEBUG_PRINT
+      errs() << "Finished Function: " << F.getName() << "\n";
+      errs() << "Number of Reorders: " << reorder << "\n";
+      errs() << "Number of wasted: " << wasted << "\n";
+      errs() << "Number of global wasted: " << globalWasted_Spec << "\n";
+      errs() << "Number of successful reorders: " << globalReorder_Spec << "\n";
+      errs() << "Number of across call wasted: " << globalAcrossCallWasted_Spec << "\n";
+      errs() << "Number of global diff chained graph-aa: " << globaldiffchainedgraphaa_Spec << "\n";
+      #endif
+    return PreservedAnalyses::all();
+ }
+
+PreservedAnalyses ReorderPass_Spec::run(Module &M, ModuleAnalysisManager &AM) {
+    // Initialize the analysis manager
+    for(auto &F : M) {
+      if (F.isDeclaration())
+        continue;
+      FunctionAnalysisManager &FAM =
+          AM.getResult<FunctionAnalysisManagerModuleProxy>(M).getManager();
+    // Run the reordering pass
+      this->runonFunction(F, AM, FAM);
+    }
+    errs() << "Finished Module: " << M.getName() << "\n";
+    errs() << "load_run_globalWasted_Spec: " << run_globalWasted_Spec << "\n";
+    errs() << "load_run_globalReorder_Spec: " << run_globalReorder_Spec << "\n";
+    errs() << "load_run_globalAcrossCallReorder_Spec: " << run_globalAcrossCallReorder_Spec << "\n";
+    errs() << "load_run_globalAcrossCallWasted_Spec: " << run_globalAcrossCallWasted_Spec << "\n";
+    errs() << "load_run_globaldiffchainedgraphaa_Spec: " << run_globaldiffchainedgraphaa_Spec << "\n";
+    errs() << "load_run_globaldiffchainedsvf_Spec: " << run_globaldiffchainedsvf_Spec << "\n";
+    errs() << "load_run_globaldiffchainedsvfgraphaa_Spec: " << run_globaldiffchainedsvfgraphaa_Spec << "\n";
+    errs() << "load_run_intra_aa_svf_diff_SpecLoad: " << run_intra_aa_svf_diff_SpecLoad << "\n";
+    // Return preserved analyses
+    return PreservedAnalyses::all();
+}
